@@ -3,4 +3,12 @@
 2. [Get Programming with Go](https://edu.anarcho-copy.org/Programming%20Languages/Go/Get%20Programming%20with%20Go.pdf)
 
 
-## Todo
+## Setup
+- Install Go
+```bash
+sudo apt update
+sudo apt install golang-go -y
+go version # check go version
+```
+- Go Hello World.
+```bash

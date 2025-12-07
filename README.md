@@ -1,5 +1,5 @@
 
-## Purpose of this repo
+## About
 > This repo contains a list of my side projects. Mostly used for project-based-learning.
 
 ## Electronics
