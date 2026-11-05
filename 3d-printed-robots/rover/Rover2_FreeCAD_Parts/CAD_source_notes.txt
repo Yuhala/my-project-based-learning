@@ -1,0 +1,3 @@
+# Rover 2 prototype CAD source (CadQuery / Python)
+# Geometry creation script is included as create_rover.py in the parent working directory;
+# use STEP files to open solids directly in FreeCAD.

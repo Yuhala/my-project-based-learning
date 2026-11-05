@@ -1,0 +1,36 @@
+# FreeCAD macro: import the included STEP parts as editable Part solids.
+# Run from FreeCAD: Macro > Macros > Execute.
+import FreeCAD as App, Part, os
+from FreeCAD import Gui
+base = os.path.dirname(os.path.abspath(__file__))
+doc = App.newDocument("Rover2_PrintableParts")
+files = [
+    "01_chassis_plate_240x180.step",
+    "02_side_rail_1.step",
+    "02_side_rail_2.step",
+    "03_TT_motor_mount_universal.step",
+    "04_ultrasonic_sensor_mount_HCSR04.step",
+    "05_camera_mount_generic.step",
+    "06_robot_arm_base_plate_80.step",
+    "07_servo_cradle_standard_40x20.step",
+    "08_arm_link_100mm.step",
+    "09_arm_link_70mm.step",
+    "10_gripper_finger_1.step",
+    "10_gripper_finger_2.step",
+    "11_electronics_tray_100x70.step",
+    "12_camera_mast_spacer_45mm.step",
+]
+colors = [(0.22,0.25,0.29),(0.28,0.31,0.35),(0.2,0.22,0.25)]
+for i, fn in enumerate(files):
+    shape = Part.Shape()
+    shape.read(os.path.join(base, fn))
+    obj = doc.addObject("PartDesign::Feature", fn.replace(".step", ""))
+    obj.Label = fn.replace(".step", "").replace("_", " ")
+    obj.Shape = shape
+    obj.ViewObject.ShapeColor = colors[i % len(colors)]
+    obj.ViewObject.LineColor = (0.08,0.08,0.08)
+    obj.ViewObject.DisplayMode = "Flat Lines"
+doc.recompute()
+Gui.activeDocument().activeView().viewAxonometric()
+Gui.activeDocument().activeView().fitAll()
+doc.recompute()

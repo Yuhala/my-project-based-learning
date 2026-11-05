@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""Slice one or more STLs for the Elegoo Centauri 2.
+
+Uses ElegooSlicer with the 0.4 mm nozzle, 0.20 mm Elegoo PLA profile,
+and a textured PEI plate (210°C nozzle, 60°C bed). Each part keeps the
+orientation it was modeled in. Several STLs (or many copies via -n) are
+arranged on the bed; extra plates are written if they do not fit on one.
+
+Release options (--easy-release, --first-layer-height, --wait-bed-cool)
+ease parts that weld to the PEI plate. Printer Z-offset is still set on
+the Centauri 2 screen; these flags only change the sliced G-code.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROFILES = SCRIPT_DIR / "profiles"
+SLICER_NAME = "ElegooSlicer_Linux_V1.5.3.5.AppImage"
+
+# Official profile first layer. Raising this is the slicer-side stand-in
+# for a slightly higher Z-offset: less smash into the PEI texture.
+DEFAULT_FIRST_LAYER_HEIGHT = 0.2
+EASY_RELEASE_FIRST_LAYER_HEIGHT = 0.28
+EASY_RELEASE_ELEPHANT_FOOT = 0.15
+DEFAULT_WAIT_BED_COOL_C = 35.0
+
+
+def main() -> int:
+    args = parse_args()
+    stls = expand_copies(args.jobs)
+    for stl in {path for path, _ in args.jobs}:
+        if not stl.is_file():
+            fail(f"STL not found: {stl}")
+        if stl.suffix.lower() != ".stl":
+            fail(f"Expected an .stl file: {stl}")
+
+    destination = output_path(args.output, stls)
+    slicer = find_slicer()
+    for path in (slicer, PROFILES / "machine.json", PROFILES / "process.json", PROFILES / "filament.json"):
+        if " " in str(path):
+            fail(f"ElegooSlicer splits paths on spaces. Move this path: {path}")
+
+    with tempfile.TemporaryDirectory(prefix="ec2-slice-") as raw:
+        work = Path(raw)
+        staged = stage_models(stls, work)
+        out_dir = work / "out"
+        out_dir.mkdir()
+        for name in ("machine.json", "process.json", "filament.json"):
+            shutil.copy2(PROFILES / name, work / name)
+        tweaks = apply_release_tweaks(work, args)
+
+        proc = run_slicer(slicer, staged, out_dir, work)
+        gcodes = finished_gcodes(out_dir, proc)
+        for gcode in gcodes:
+            check_centauri2(gcode)
+        written = write_outputs(destination, stls, gcodes)
+
+    for path in written:
+        print(path)
+        print(summary(path, tweaks))
+    if len(written) > 1:
+        print(f"elegoo-slice: {len(written)} plates (parts did not fit on one bed)", file=sys.stderr)
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    # Peel "file.stl [-n N]" jobs out first so -n can sit after a file name.
+    jobs, flag_argv = peel_stl_jobs(sys.argv[1:])
+    parser = argparse.ArgumentParser(
+        usage="elegoo-slice [options] stl [-n N] [stl [-n N] ...]",
+        description=(
+            "Slice one or more STLs for the Elegoo Centauri 2 "
+            "(0.4 mm nozzle, 0.20 mm layers, Elegoo PLA, textured PEI). "
+            "Several models are arranged on one plate (or several plates if needed). "
+            "Put -n / --copies after an STL to print that many copies of it."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  elegoo-slice track_link.stl -n 34\n"
+            "  elegoo-slice track_link.stl -n 34 axle_sleeve.stl -n 8\n"
+            "  elegoo-slice finger_idle.stl finger_drive.stl"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help=(
+            "Destination directory, or a .gcode file path. "
+            "Default: a Centauri 2 file name in the current directory. "
+            "If several plates are needed, -o must be a directory "
+            "(or the default name is used with _plate1, _plate2, …)."
+        ),
+    )
+    parser.add_argument(
+        "--easy-release",
+        action="store_true",
+        help=(
+            "Less first-layer smash for parts that stick hard to PEI: "
+            f"first layer {EASY_RELEASE_FIRST_LAYER_HEIGHT} mm "
+            f"(default {DEFAULT_FIRST_LAYER_HEIGHT} mm) and a slightly "
+            "stronger elephant-foot trim. Combine with --wait-bed-cool "
+            "if you want the printer to wait for the bed to cool."
+        ),
+    )
+    parser.add_argument(
+        "--first-layer-height",
+        type=float,
+        metavar="MM",
+        help=(
+            "Override the first-layer height in mm. Higher than 0.20 leaves "
+            "more gap under the nozzle (same idea as raising Z-offset). "
+            f"Default with --easy-release: {EASY_RELEASE_FIRST_LAYER_HEIGHT}."
+        ),
+    )
+    parser.add_argument(
+        "--wait-bed-cool",
+        nargs="?",
+        const=DEFAULT_WAIT_BED_COOL_C,
+        type=float,
+        metavar="C",
+        help=(
+            "After the print, wait until the bed cools to this temperature "
+            f"(default {DEFAULT_WAIT_BED_COOL_C:.0f}°C if the flag is given "
+            "with no value). PLA often releases as the plate contracts."
+        ),
+    )
+    args = parser.parse_args(flag_argv)
+    if not jobs:
+        parser.error("the following arguments are required: stl")
+    if args.first_layer_height is not None and not (0.12 <= args.first_layer_height <= 0.4):
+        fail("--first-layer-height must be between 0.12 and 0.40 mm")
+    if args.wait_bed_cool is not None and not (20.0 <= args.wait_bed_cool <= 55.0):
+        fail("--wait-bed-cool must be between 20 and 55°C")
+    args.jobs = [(path.expanduser().resolve(), count) for path, count in jobs]
+    return args
+
+
+def peel_stl_jobs(argv: list[str]) -> tuple[list[tuple[Path, int]], list[str]]:
+    """Split argv into (stl, copies) jobs and the remaining flag argv.
+
+    Accepts:  part.stl -n 34   or   part.stl --copies 34
+    """
+    jobs: list[tuple[Path, int]] = []
+    other: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        looks_stl = arg.lower().endswith(".stl") or (
+            not arg.startswith("-") and Path(arg).suffix.lower() == ".stl"
+        )
+        if looks_stl:
+            path = Path(arg)
+            count = 1
+            if i + 2 < len(argv) and argv[i + 1] in ("-n", "--copies"):
+                try:
+                    count = int(argv[i + 2])
+                except ValueError:
+                    fail(f"invalid copy count after {arg}: {argv[i + 2]}")
+                i += 3
+            else:
+                i += 1
+            if count < 1:
+                fail(f"copy count for {arg} must be ≥ 1")
+            if count > 500:
+                fail(f"copy count for {arg} is {count}; maximum is 500")
+            jobs.append((path, count))
+            continue
+        other.append(arg)
+        i += 1
+    return jobs, other
+
+
+def expand_copies(jobs: list[tuple[Path, int]]) -> list[Path]:
+    """Repeat each STL path according to its -n count."""
+    out: list[Path] = []
+    for path, count in jobs:
+        out.extend([path] * count)
+    return out
+
+
+def apply_release_tweaks(work: Path, args: argparse.Namespace) -> list[str]:
+    """Patch the staged Elegoo profiles for easier PEI release.
+
+    True Z-offset lives on the printer. These changes only affect the
+    sliced first layer and the end G-code.
+    """
+    process_path = work / "process.json"
+    machine_path = work / "machine.json"
+    process = json.loads(process_path.read_text())
+    machine = json.loads(machine_path.read_text())
+    notes: list[str] = []
+
+    first_layer = args.first_layer_height
+    if first_layer is None and args.easy_release:
+        first_layer = EASY_RELEASE_FIRST_LAYER_HEIGHT
+    if first_layer is not None:
+        process["initial_layer_print_height"] = _fmt_mm(first_layer)
+        notes.append(f"first layer {_fmt_mm(first_layer)} mm")
+
+    if args.easy_release:
+        process["elefant_foot_compensation"] = _fmt_mm(EASY_RELEASE_ELEPHANT_FOOT)
+        notes.append(f"elephant foot {_fmt_mm(EASY_RELEASE_ELEPHANT_FOOT)} mm")
+
+    if args.wait_bed_cool is not None:
+        machine["machine_end_gcode"] = inject_bed_cool_wait(
+            machine["machine_end_gcode"], args.wait_bed_cool
+        )
+        notes.append(f"wait bed ≤ {args.wait_bed_cool:.0f}°C")
+
+    if notes:
+        process_path.write_text(json.dumps(process, indent=2) + "\n")
+        machine_path.write_text(json.dumps(machine, indent=2) + "\n")
+    return notes
+
+
+def inject_bed_cool_wait(end_gcode: str, celsius: float) -> str:
+    """Insert a bed cool-down wait after the bed heater is turned off."""
+    marker = "M140 S0 ;Turn-off bed"
+    wait = (
+        f"{marker}\n"
+        f"M190 R{celsius:.0f} ; wait for bed cool so the part releases from PEI"
+    )
+    if marker in end_gcode:
+        return end_gcode.replace(marker, wait, 1)
+    return (
+        f"; wait for bed cool so the part releases from PEI\n"
+        f"M140 S0\n"
+        f"M190 R{celsius:.0f}\n"
+        + end_gcode
+    )
+
+
+def _fmt_mm(value: float) -> str:
+    text = f"{value:.3f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def output_path(option: Path | None, stls: list[Path]) -> Path:
+    """Resolve where the finished G-code should be written.
+
+    The Elegoo file name is filled in after slicing, when the print time
+    is known. A .gcode path is used exactly as given.
+    """
+    if option is None:
+        return Path.cwd() / default_name(stls, "TIME")
+    option = option.expanduser()
+    if option.exists() and option.is_dir():
+        return option.resolve() / default_name(stls, "TIME")
+    if option.suffix.lower() == ".gcode":
+        return option.resolve()
+    return option.resolve() / default_name(stls, "TIME")
+
+
+def default_name(stls: list[Path], print_time: str) -> str:
+    return f"EC2_0.4_{model_label(stls)}_Elegoo PLA_0.2_{print_time}.gcode"
+
+
+def model_label(stls: list[Path]) -> str:
+    """Build the name segment for one or more models.
+
+    A single file keeps its stem. Several files are joined with '+', and
+    a repeated file is marked with a count, as in 'wheel_rim_x4'.
+    """
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for stl in stls:
+        stem = stl.stem
+        if stem not in counts:
+            order.append(stem)
+            counts[stem] = 0
+        counts[stem] += 1
+    parts = [stem if counts[stem] == 1 else f"{stem}_x{counts[stem]}" for stem in order]
+    label = "+".join(parts)
+    if len(label) <= 150:
+        return label
+    if len(stls) == 1:
+        return stls[0].stem[:150]
+    return f"{stls[0].stem[:80]}+{len(stls) - 1}more"
+
+
+def stage_models(stls: list[Path], work: Path) -> list[Path]:
+    """Copy models to space-free names. ElegooSlicer splits paths on spaces."""
+    staged: list[Path] = []
+    width = 3 if len(stls) >= 100 else 2
+    for index, stl in enumerate(stls, start=1):
+        stem = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stl.stem).strip("_") or "model"
+        path = work / f"{index:0{width}d}_{stem}.stl"
+        shutil.copy2(stl, path)
+        staged.append(path)
+    return staged
+
+
+def find_slicer() -> Path:
+    candidates: list[Path] = []
+    env = os.environ.get("ELEGOO_SLICER")
+    if env:
+        candidates.append(Path(env).expanduser())
+    candidates.append(SCRIPT_DIR / SLICER_NAME)
+    share = Path.home() / ".local" / "share" / "elegoo-slicer"
+    candidates.extend(sorted(share.glob("ElegooSlicer*.AppImage")))
+    candidates.extend(sorted(Path("/tmp/elegoo-slicer").glob("ElegooSlicer*.AppImage")))
+    extracted = Path("/tmp/elegoo-slicer/squashfs-root/bin/elegoo-slicer")
+    candidates.append(extracted)
+    for path in candidates:
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
+    fail(
+        "ElegooSlicer was not found. Set ELEGOO_SLICER to the AppImage, "
+        f"or place {SLICER_NAME} in {share}."
+    )
+
+
+def run_slicer(
+    slicer: Path, stls: list[Path], out_dir: Path, work: Path
+) -> subprocess.CompletedProcess[str]:
+    cmd = [
+        str(slicer),
+        "--slice",
+        "0",
+        "--orient",
+        "0",
+        "--arrange",
+        "1",
+        "--load-settings",
+        f"{work / 'machine.json'};{work / 'process.json'}",
+        "--load-filaments",
+        str(work / "filament.json"),
+        "--outputdir",
+        str(out_dir),
+        *(str(stl) for stl in stls),
+    ]
+    env = os.environ.copy()
+    cwd = None
+    if slicer.suffix.lower() == ".appimage" or "AppImage" in slicer.name:
+        env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+    else:
+        # The extracted binary loads libraries and resources beside itself.
+        env["LD_LIBRARY_PATH"] = str(slicer.parent) + (
+            os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else ""
+        )
+        cwd = str(slicer.parent.parent)
+    return subprocess.run(cmd, cwd=cwd, env=env, text=True, capture_output=True)
+
+
+def finished_gcodes(out_dir: Path, proc: subprocess.CompletedProcess[str]) -> list[Path]:
+    result_path = out_dir / "result.json"
+    result = {}
+    if result_path.is_file():
+        result = json.loads(result_path.read_text())
+    gcodes = sorted(out_dir.glob("*.gcode"))
+    if proc.returncode != 0 or result.get("return_code") not in (None, 0) or not gcodes:
+        detail = (proc.stderr or proc.stdout or result.get("error_string") or "").strip()
+        fail(f"ElegooSlicer failed (exit {proc.returncode}). {detail}".rstrip())
+    # Prefer plate_N order when several plates were filled.
+    plates = [out_dir / f"plate_{i}.gcode" for i in range(1, len(gcodes) + 1)]
+    if all(p.is_file() for p in plates):
+        return plates
+    return gcodes
+
+
+def write_outputs(destination: Path, stls: list[Path], gcodes: list[Path]) -> list[Path]:
+    """Copy one or more plate G-code files to the destination name/dir."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if len(gcodes) == 1:
+        final = finalize_name(destination, stls, gcodes[0])
+        final.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(gcodes[0], final)
+        return [final]
+
+    if destination.suffix.lower() == ".gcode":
+        fail(
+            f"Need {len(gcodes)} plates, but -o points at a single .gcode file. "
+            "Pass a directory with -o, or omit -o."
+        )
+
+    # destination is …/NAME_TIME.gcode placeholder, or a directory child path
+    written: list[Path] = []
+    for index, gcode in enumerate(gcodes, start=1):
+        plate_dest = destination.with_name(
+            destination.stem + f"_plate{index}" + destination.suffix
+        )
+        # If still has TIME placeholder, fill from this plate's time
+        if "_TIME" in plate_dest.name or plate_dest.name.endswith("_TIME.gcode"):
+            pass
+        plate_dest = finalize_plate_name(plate_dest, stls, gcode, index)
+        plate_dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(gcode, plate_dest)
+        written.append(plate_dest)
+    return written
+
+
+def finalize_plate_name(path: Path, stls: list[Path], gcode: Path, plate: int) -> Path:
+    """Like finalize_name, but tags _plateN when several beds are needed."""
+    if "TIME" not in path.name:
+        if f"_plate{plate}" not in path.stem:
+            return path.with_name(f"{path.stem}_plate{plate}{path.suffix}")
+        return path
+    fields = gcode_fields(gcode, ("estimated printing time (normal mode)",))
+    raw = fields.get("estimated printing time (normal mode)", "")
+    timed = default_name(stls, format_print_time(raw))
+    return path.with_name(timed.replace(".gcode", f"_plate{plate}.gcode"))
+
+
+def check_centauri2(gcode: Path) -> None:
+    text = gcode.read_text(errors="replace")
+    required = {
+        "printer": "printer_model = Elegoo Centauri 2",
+        "start": "C2_START_GCODE",
+        "bed": "Textured PEI Plate",
+        "nozzle": "nozzle_temperature = 210",
+        "bed temp": "first_layer_bed_temperature = 60",
+    }
+    missing = [name for name, needle in required.items() if needle not in text]
+    if missing or "CC2_START_GCODE" in text or "Centauri Carbon" in text:
+        fail(
+            "Slice is not the Elegoo Centauri 2 PLA profile "
+            f"({', '.join(missing) or 'unexpected printer'})."
+        )
+
+
+def summary(gcode: Path, tweaks: list[str] | None = None) -> str:
+    fields = gcode_fields(
+        gcode,
+        (
+            "estimated printing time (normal mode)",
+            "total filament used [g]",
+            "initial_layer_print_height",
+        ),
+    )
+    time = fields.get("estimated printing time (normal mode)", "unknown time")
+    grams = fields.get("total filament used [g]", "?")
+    first = fields.get("initial_layer_print_height", "0.2")
+    line = (
+        f"Elegoo Centauri 2, 0.20 mm (first {first} mm), Elegoo PLA, "
+        f"210°C / 60°C textured PEI, {time}, {grams} g"
+    )
+    if tweaks:
+        line += f" [{'; '.join(tweaks)}]"
+    return line
+
+
+def gcode_fields(gcode: Path, keys: tuple[str, ...]) -> dict[str, str]:
+    wanted = set(keys)
+    found: dict[str, str] = {}
+    for line in gcode.read_text(errors="replace").splitlines():
+        if not line.startswith("; ") or " = " not in line:
+            continue
+        key, value = line[2:].split(" = ", 1)
+        if key in wanted:
+            found[key] = value.strip()
+            if len(found) == len(wanted):
+                break
+    return found
+
+
+def finalize_name(path: Path, stls: list[Path], gcode: Path) -> Path:
+    if path.name != default_name(stls, "TIME"):
+        return path
+    fields = gcode_fields(gcode, ("estimated printing time (normal mode)",))
+    raw = fields.get("estimated printing time (normal mode)", "")
+    return path.with_name(default_name(stls, format_print_time(raw)))
+
+
+def format_print_time(raw: str) -> str:
+    """Match Elegoo export names: '11m 9s' -> '11m9s', '2h 2m 4s' -> '2h2m'."""
+    parts = raw.split()
+    if not parts:
+        return "unknown"
+    if any(part[-1:] in "dh" for part in parts):
+        parts = [part for part in parts if not part.endswith("s")]
+    return "".join(parts)
+
+
+def fail(message: str) -> None:
+    print(f"elegoo-slice: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)
