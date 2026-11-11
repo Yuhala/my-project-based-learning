@@ -2,8 +2,6 @@
 
 ESP32-S3 · 2 × N20 · TB6612FNG · pan camera
 
-Replace any image under `images/` when you have better photos; the grid below will pick them up automatically if you keep the same filenames.
-
 ## Gallery
 
 | | | |

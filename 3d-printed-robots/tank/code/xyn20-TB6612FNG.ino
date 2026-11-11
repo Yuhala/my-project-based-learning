@@ -110,7 +110,7 @@ void stopMotors() {
   driveTank(0, 0);
 }
 
-// Runs LEFT alone, then RIGHT alone. Use this to see which side is dead.
+// Runs LEFT alone, then RIGHT alone. Used for testing
 void sideCheckRoutine() {
   Serial.println("LEFT only");
   driveLeft(180);
@@ -170,8 +170,8 @@ void turnRoutine() {
 }
 
 void loop() {
-  //sideCheckRoutine();   // diagnose one-wheel problem first
+  //sideCheckRoutine();   
    testRoutine();
   // spinRoutine();
   // turnRoutine();
-}
+  //more: todo; just front and back driving is enough for a proof-of-concept tank robot :)
