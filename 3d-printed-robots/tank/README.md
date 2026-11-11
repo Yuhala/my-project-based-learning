@@ -87,3 +87,6 @@ The M3×40, M4 and M5 screws aren't needed.
 ## Tips
 - **Print one test set first:** 2 links, 1 sprocket, 1 motor cap. Check the pin fit, the motor fit, and the D-shaft fit (`N20_D` / `N20_FLAT`, `PIN_D`).
 - **Clone N20s vary slightly.** If yours is longer than 24 mm (e.g. with an encoder), raise `N20_LEN` and re-run.
+
+## Disclaimer
+- Most of these parts for the 3D model (STL files and images) were created with the help of AI. 

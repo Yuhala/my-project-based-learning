@@ -8,6 +8,8 @@
 - I've mostly been generating 3D models (STL) with Claude AI, and to my great surprise, it's better than you may realize. Try it out! 
 - You can find a list of 3D models I've generated and printed. I'm currently putting together all the electronics and writing the micro-controller programs to breath some life into these toys. 
 - Some 3D models:
+
+![fpv3](./3d-printed-robots/tank/tank_images/images/01_closed_front_left.png)
 ![fpv3](./3d-printed-robots/drone/FPV3_drone_ESP32S3_v2/preview/fpv3_iso.png)
 ![rover](./3d-printed-robots/rover/claude/files/rover2_preview.png)
 
